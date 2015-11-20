@@ -1,0 +1,84 @@
+#cloud-config
+---
+write-files:
+  - path: /etc/conf.d/nfs
+    permissions: '0644'
+    content: |
+      OPTS_RPC_MOUNTD=""
+  - path: /opt/bin/wupiao
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+      [ -n "$1" ] && \
+        while ! curl --output /dev/null --silent --head --fail http://$1; do sleep 2 && echo -n .; done;
+      exit $?
+hostname: ${hostname}
+coreos:
+  etcd2:
+    name: default
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    advertise-client-urls: http://$private_ipv4:2379,http://$$private_ipv4:4001
+    initial-cluster-token: etcd
+    listen-peer-urls: http://$$private_ipv4:2380,http://$$private_ipv4:7001
+    initial-advertise-peer-urls: http://$$private_ipv4:2380
+    initial-cluster: default=http://$$private_ipv4:2380
+    initial-cluster-state: new
+  fleet:
+    metadata: "role=dns"
+  units:
+    - name: setup-network-environment.service
+      command: start
+      content: |
+        [Unit]
+        Description=Setup Network Environment
+        Documentation=https://github.com/kelseyhightower/setup-network-environment
+        Requires=network-online.target
+        After=network-online.target
+
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStartPre=/usr/bin/curl -L -s https://github.com/kelseyhightower/setup-network-environment/releases/download/1.0.1/setup-network-environment -o /opt/bin/setup-network-environment
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+        ExecStart=/opt/bin/setup-network-environment
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: fleet.service
+      command: start
+    - name: docker.service
+      command: start
+    - name: skydns.service
+      command: start
+      content: |
+        [Unit]
+        Description=SkyDNS Service
+        Documentation=https://registry.hub.docker.com/u/skynetservices/
+        Requires=setup-network-environment.service etcd2.service docker.service
+        After=setup-network-environment.service etcd2.service docker.service
+
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        ExecStartPre=-/usr/bin/docker pull skynetservices/skydns
+        ExecStartPre=-/usr/bin/docker rm -f skydns
+        ExecStartPre=/usr/bin/curl --retry 10 --retry-delay 2 -XPUT http://$$private_ipv4:4001/v2/keys/skydns/config -d 'value={"domain":"${domain}"}'
+        ExecStart=/usr/bin/docker run --name skydns -p 53:53/tcp -p 53:53/udp -m 64M -e "SKYDNS_DOMAIN=${domain}" -e "ETCD_MACHINES=http://$$private_ipv4:4001" skynetservices/skydns -addr 0.0.0.0:53
+        ExecStop=/usr/bin/docker rm -f skydns
+    - name: etcdbrowser.service
+      command: start
+      content: |
+        [Unit]
+        Description=ETCD Browser Service
+        Documentation=https://github.com/henszey/etcd-browser
+        After=etcd2.service setup-network-environment.service docker.service
+        Requires=etcd2.service setup-network-environment.service docker.service
+
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        ExecStartPre=-/usr/bin/docker pull buddho/etcd-browser
+        ExecStartPre=-/usr/bin/docker rm -f etcd-browser
+        ExecStart=/usr/bin/docker run --name etcd-browser -p 8000:8000 --env ETCD_HOST=$${DEFAULT_IPV4} --env AUTH_PASS=admin -m 16M buddho/etcd-browser
+        ExecStop=/usr/bin/docker rm -f etcd-browser
+
+  update:
+    group: alpha
+    reboot-strategy: etcd-lock
